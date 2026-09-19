@@ -15,7 +15,7 @@ pfwd 是一个 L4 端口转发器：监听本机端口，把收到的流量原�
 | IPv4 / IPv6 | 任意组合，包括 IPv4 ↔ IPv6 跨族转发（userspace 模式） |
 | 两种数据面 | `userspace`（进程内转发）与 `nftables`（内核 DNAT + flowtable），按场景选择 |
 | 低依赖 | 无 libevent / glib / C++ / Lua / Python 等 |
-| 生命周期干净 | nftables 模式下规则与 sysctl 绑定进程生命周期，退出即清理 |
+| 生命周期干净 | nftables 模式下规则、sysctl 与 FORWARD policy 绑定进程生命周期，退出即清理 / 还原 |
 | 启动期失败原则 | 不可行的配置在启动阶段明确失败，绝不出现"启动成功但流量不通" |
 
 **明确不做**：应用层协议改写、TLS 终止、鉴权、负载均衡 / 多后端 / 健康检查、配置文件 / 热重载 / 控制 socket、iptables 兼容层、eBPF / XDP 数据面、内核模块。
@@ -31,8 +31,8 @@ pfwd 是一个 L4 端口转发器：监听本机端口，把收到的流量原�
 | 转发位置 | 本进程（TCP 载荷经内核管道零拷贝，不进用户内存） | 内核 DNAT/SNAT + flowtable 快速路径 |
 | IPv4 ↔ IPv6 跨族 | **支持** | **不支持**，启动即报错（内核 DNAT 无 NAT64 能力） |
 | 所需权限 | 普通用户（监听 < 1024 端口需 `CAP_NET_BIND_SERVICE`） | `CAP_NET_ADMIN` |
-| 是否改动系统状态 | 否 | 是（一张 nft table + 2 项 sysctl），退出还原 |
-| 被强杀后 | 无残留 | 规则残留（下次启动自愈）、sysctl 残留（无法自愈） |
+| 是否改动系统状态 | 否 | 是（一张 nft table + 2 项 sysctl + FORWARD policy），退出还原 |
+| 被强杀后 | 无残留 | 规则残留（下次启动自愈）、sysctl / FORWARD policy 残留（无法可靠自愈） |
 | 上游看到的源地址 | 本机地址 | 本机地址（SNAT 后），上游端 ACL/基于源 IP 的日志会失效 |
 | 统计 | 进程内计数器，精确 | nft counter（包/字节），无连接级细节 |
 | 适用场景 | 跨族转发、非 root、容器内、需要精确统计 | 网关 / 路由器高带宽、CPU 受限设备、连接数极大 |
@@ -132,6 +132,7 @@ pfwd -m nftables 0.0.0.0:25 8.8.8.8:53 --check
 - **SNAT 源地址 = 规则的监听地址**（客户端拨入的那个 IP）。监听地址为通配（`0.0.0.0`/`[::]`）时静态无法确定源地址，此时回退 masquerade。
 - **幂等自愈**：启动时先删除同名 table 再重建，上次异常退出残留的规则自动清除。
 - **sysctl 自动管理**：存在 IPv4/IPv6 规则时自动开启 `ip_forward` / `ipv6.conf.all.forwarding`，退出时还原。运行期间若值被第三方改过，则不还原（不覆盖别人的设置）。多实例通过文件锁引用计数，最后一个实例才还原。`--no-sysctl` 可完全关闭此行为。
+- **FORWARD 默认策略兜底**：仅开启 `ip_forward` 还不够；若 IPv4 的 iptables `FORWARD` policy 为 `DROP`，DNAT 后的数据包仍会在转发阶段被丢弃。nftables 模式启动时将其设为 `ACCEPT`（等价于 `iptables -P FORWARD ACCEPT`），不向 Docker / 其他第三方链插入规则；退出时按与 sysctl 相同的原则恢复原策略。
 - **跨族规则直接拒绝**（FATAL），并提示改用 userspace 模式——否则规则装得上但流量全不通。
 - flowtable 是纯加速：不支持时自动降级（硬件 offload → 软件 flowtable → 普通转发路径），只影响性能，不影响正确性，只产生 WARN。
 - DNAT 目标是本机地址时给出 WARN（流量仍正确，只是不走 forward 路径、无加速）。
@@ -145,6 +146,7 @@ pfwd -m nftables 0.0.0.0:25 8.8.8.8:53 --check
 iptables -t nat -A PREROUTING  -p tcp -d 192.168.1.10 --dport 25 -j DNAT --to-destination 8.8.8.8:53
 iptables -t nat -A OUTPUT      -p tcp -d 192.168.1.10 --dport 25 -j DNAT --to-destination 8.8.8.8:53  # 本机发起的流量也能转发
 iptables -t nat -A POSTROUTING -p tcp -d 8.8.8.8 --dport 53 -j SNAT --to-source 192.168.1.10
+iptables -P FORWARD ACCEPT
 # + ip_forward 自动开启、退出自动清理、重复执行不会累积规则
 ```
 
@@ -163,5 +165,5 @@ iptables -t nat -A POSTROUTING -p tcp -d 8.8.8.8 --dport 53 -j SNAT --to-source 
 | 5 | UDP 包 > 2048 字节被丢弃 | 巨帧场景不可用 |
 | 6 | nftables 模式不支持跨族 | 内核 DNAT 无 NAT64 能力，物理限制 |
 | 7 | nftables 模式上游看不到真实客户端 IP | SNAT 的代价；仅当本机在回程路径上才能省掉 SNAT |
-| 8 | **SIGKILL / 断电后 sysctl 残留** | 规则可自愈，sysctl 不能（程序无法知道原始值）。检查命令：`sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding`；需要保证清理就用 `--no-sysctl` |
+| 8 | **SIGKILL / 断电后系统状态残留** | 规则可自愈，sysctl / FORWARD policy 不能可靠自愈（程序无法知道原始值）。检查命令：`sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding`、`iptables -S FORWARD`；需要保证 sysctl 清理就用 `--no-sysctl` |
 | 9 | 与其他 NAT 软件共存 | 机器上跑着 Docker / libvirt / tailscale 时，建议用 `--no-sysctl`，把 `ip_forward` 交给它们管 |
